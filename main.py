@@ -7,11 +7,13 @@ from network.dtp import DTPNetwork, DTPLoss, DTPLossConfig
 
 def create_simple_dtp_network():
     layers = [
-        nn.Linear(784, 1000),
+        nn.Linear(6, 128),  # 6 input features (2 angles in sin/cos + 2D target)
         nn.ReLU(),
-        nn.Linear(1000, 500),
+        nn.Linear(128, 64),
         nn.ReLU(),
-        nn.Linear(500, 10)
+        nn.Linear(64, 64),
+        nn.ReLU(),
+        nn.Linear(64, 6)    # 6 output features (delta angles + target position)
     ]
     return DTPNetwork(layers)
 
@@ -97,22 +99,43 @@ def train_step(network: DTPNetwork,
     return forward_loss.item(), total_feedback_loss.item()
 
 
-# Create network and loss function
-network = create_simple_dtp_network()
-loss_fn = DTPLoss(DTPLossConfig())
+if __name__ == "__main__":
+    from environment import create_batch
+    # parameters
+    batch_size = 64
+    num_epochs = 100
 
-# Create optimizers
-forward_optimizer = torch.optim.SGD(network.parameters(), lr=0.01)
-feedback_optimizer = torch.optim.SGD(
-    [p for layer in network.dtp_layers
-     for p in layer.feedback_layer.parameters()],
-    lr=0.01
-)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#  TODO: Training loop with dataloader from reaching environment
-for batch in dataloader:
-    inputs, targets = batch
-    f_loss, b_loss = train_step(
-        network, loss_fn, inputs, targets,
-        forward_optimizer, feedback_optimizer
+    # Create network and loss function
+    network = create_simple_dtp_network()
+    network = network.float()  # Ensure network is in float32
+    loss_fn = DTPLoss(DTPLossConfig())
+
+    # Create optimizers
+    forward_optimizer = torch.optim.SGD(network.parameters(), lr=0.01)
+    feedback_optimizer = torch.optim.SGD(
+        [p for layer in network.dtp_layers
+         for p in layer.feedback_layer.parameters()],
+        lr=0.01
     )
+
+    for _ in range(num_epochs):
+        inputs, targets = create_batch(batch_size=batch_size,
+                                       arm="right",
+                                       device=device)
+
+        # ensure inputs and targets are on the same device as the network
+        inputs = inputs.float().to(device)
+        targets = targets.float().to(device)
+
+        f_loss, b_loss = train_step(
+            network=network,
+            loss_fn=loss_fn,
+            input=inputs,
+            target=targets,
+            forward_optimizer=forward_optimizer,
+            feedback_optimizer=feedback_optimizer
+        )
+
+        print(f"Forward loss: {f_loss}, Feedback loss: {b_loss}")
