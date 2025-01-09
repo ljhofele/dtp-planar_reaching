@@ -122,8 +122,9 @@ class DTPLoss:
             reconstructed = layer.feedback(noisy_output)
 
             # L-DRL loss
-            loss = -noise.T @ (reconstructed - noisy_input) + \
-                   0.5 * torch.norm(reconstructed - noisy_input) ** 2
+            reconstruction_error = reconstructed - noisy_input
+            loss = torch.mean(0.5 * torch.sum(reconstruction_error ** 2, dim=1) -
+                              torch.sum(noise * reconstruction_error, dim=1))
 
             batch_losses.append(loss)
 
