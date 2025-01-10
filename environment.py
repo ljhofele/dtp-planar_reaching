@@ -8,7 +8,7 @@ from kinematics.planar_arms import PlanarArms
 
 
 def data_transform(thetas: np.ndarray,
-                   xy: np.ndarray, ):
+                   xy: np.ndarray,):
     """
     Transforms angles in radians to sin and cos values and concatenates with xy coordinates
     :param thetas: angle in radians
@@ -53,18 +53,15 @@ def generate_random_coordinates(arm: str,
                                 return_thetas_radians: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate random reaching points that are at least min_distance away from initial position.
+    :param arm: Right or left arm
+    :param initial_thetas: Initial joint angles in radians
+    :param num_movements: Number of random points to generate
+    :param x_bounds: X-axis bounds for the workspace
+    :param y_bounds: Y-axis bounds for the workspace
+    :param min_distance: Minimum distance required from initial position
+    :param return_thetas_radians: Whether to return angles in radians
 
-    Args:
-        arm: Type of planar arm
-        initial_thetas: Initial joint angles in radians
-        num_movements: Number of random points to generate
-        x_bounds: X-axis bounds for the workspace
-        y_bounds: Y-axis bounds for the workspace
-        min_distance: Minimum distance required from initial position
-        return_thetas_radians: Whether to return angles in radians
-
-    Returns:
-        Tuple of (joint angle changes, normalized xy coordinates)
+    :return: Tuple of (joint angle changes, normalized xy coordinates)
     """
     lower_arm_limits, upper_arm_limits = PlanarArms.get_bounds()
     init_pos = PlanarArms.forward_kinematics(arm=arm,
@@ -72,7 +69,7 @@ def generate_random_coordinates(arm: str,
                                              radians=False)[:, -1]
 
     random_movement_thetas = []
-    random_xy = []
+    random_changed_xy = []
 
     while len(random_movement_thetas) < num_movements:
         # Generate random joint angles within limits
@@ -93,12 +90,13 @@ def generate_random_coordinates(arm: str,
                 theta_change = np.degrees(theta_change)
 
             # Normalize the xy coordinates
-            normalized_xy = norm_xy(current_pos, x_bounds=x_bounds, y_bounds=y_bounds)
+            normalized_random_xy = norm_xy(current_pos, x_bounds=x_bounds, y_bounds=y_bounds)
+            normalized_init_xy = norm_xy(init_pos, x_bounds=x_bounds, y_bounds=y_bounds)
 
             random_movement_thetas.append(theta_change)
-            random_xy.append(normalized_xy)
+            random_changed_xy.append(normalized_random_xy - normalized_init_xy)
 
-    return np.array(random_movement_thetas), np.array(random_xy)
+    return np.array(random_movement_thetas), np.array(random_changed_xy)
 
 
 def norm_xy(xy: np.ndarray,
@@ -126,7 +124,7 @@ def norm_xy(xy: np.ndarray,
 if __name__ == "__main__":
     thetas, xys = generate_random_coordinates(arm='right',
                                               initial_thetas=np.array([0., 0.]),
-                                              num_movements=100, )
+                                              num_movements=100,)
 
     print(thetas.shape, xys.shape)
 

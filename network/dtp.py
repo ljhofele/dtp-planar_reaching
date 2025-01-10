@@ -63,8 +63,7 @@ class DTPNetwork(nn.Module):
 
     def compute_targets(self,
                         activations: List[torch.Tensor],
-                        final_target: torch.Tensor,
-                        beta: float = 0.1) -> List[torch.Tensor]:
+                        final_target: torch.Tensor,) -> List[torch.Tensor]:
         """Compute layer-wise targets using DTP."""
         targets = [None] * len(activations)
         targets[-1] = final_target
@@ -104,7 +103,8 @@ class DTPLoss:
     def feedback_loss(self,
                       layer: DTPLayer,
                       input: torch.Tensor,
-                      output: torch.Tensor) -> torch.Tensor:
+                      output: torch.Tensor,  # We are using L-DRL with noisy outputs from the forward pass
+                      ) -> torch.Tensor:
         """Compute feedback training loss for a single layer."""
         if not layer.requires_feedback_training:
             return torch.tensor(0.0, device=input.device)
@@ -133,24 +133,55 @@ class DTPLoss:
     def forward_loss(self,
                      network: DTPNetwork,
                      input: torch.Tensor,
-                     target: torch.Tensor) -> torch.Tensor:
-        """Compute forward training loss."""
+                     target: torch.Tensor,
+                     norm_grad: bool = True) -> torch.Tensor:
+        """Compute forward training loss with numerical stability measures."""
         # Forward pass
-        output, activations = network(input)
+        with torch.set_grad_enabled(True):
+            output, activations = network(input)
 
-        # Compute initial target at output layer
-        ce_loss = F.cross_entropy(output, target)
-        grad = torch.autograd.grad(ce_loss, output)[0]
-        output_target = output - self.config.beta * grad
+        # Calculate initial target with gradient scaling
+        temp_output = output.detach().clone()
+        temp_output.requires_grad_(True)
+        ce_loss = F.cross_entropy(temp_output, target, reduction="sum")
+        grad = torch.autograd.grad(
+            ce_loss,
+            temp_output,
+            only_inputs=True,
+            create_graph=False
+        )[0]
+
+        # Scale gradients to prevent explosion
+        grad_norm = torch.norm(grad)
+        if grad_norm > 1.0:
+            grad = grad / grad_norm
+
+        output_target = output.detach() + (-self.config.beta * grad)
 
         # Compute targets for all layers
         targets = network.compute_targets(activations, output_target)
 
-        # Sum up MSE losses between activations and targets
+        # Calculate layer-wise losses with stability measures
         layer_losses = []
-        for h, t in zip(activations[1:], targets[1:]):  # Skip input layer
-            if h.requires_grad:
-                layer_loss = 0.5 * torch.mean((h - t) ** 2)
-                layer_losses.append(layer_loss)
+        for i, (h, t) in enumerate(zip(activations[1:], targets[1:])):
+            if not h.requires_grad:
+                h.requires_grad_(True)
+
+            # Normalize activations and targets
+            h_norm = torch.norm(h)
+            t_norm = torch.norm(t)
+            if h_norm > 1.0:
+                h = h / h_norm
+            if t_norm > 1.0:
+                t = t / t_norm
+
+            # Calculate loss with numerical stability
+            loss = 0.5 * ((h - t) ** 2).view(h.size(0), -1)
+            loss = loss.sum(1).mean()  # Sum over features, mean over batch
+
+            # Add small epsilon to prevent exactly zero loss
+            loss = loss + 1e-8
+
+            layer_losses.append(loss)
 
         return torch.sum(torch.stack(layer_losses))

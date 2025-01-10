@@ -15,6 +15,14 @@ def create_simple_dtp_network():
         nn.ReLU(),
         nn.Linear(64, 6)    # 6 output features (delta angles + target position)
     ]
+
+    # Ensure all parameters have requires_grad=True
+    for layer in layers:
+        if hasattr(layer, 'weight'):
+            layer.weight.requires_grad_(True)
+        if hasattr(layer, 'bias'):
+            layer.bias.requires_grad_(True)
+
     return DTPNetwork(layers)
 
 
@@ -66,34 +74,50 @@ def train_step(network: DTPNetwork,
                input: torch.Tensor,
                target: torch.Tensor,
                forward_optimizer: torch.optim.Optimizer,
-               feedback_optimizer: torch.optim.Optimizer):
+               feedback_optimizer: torch.optim.Optimizer,
+               max_grad_norm: float = 1.0):  # Add gradient clipping threshold
     """Single training step for DTP."""
     # Train feedback weights
     feedback_optimizer.zero_grad()
     total_feedback_loss = torch.tensor(0.0, device=input.device)
 
     # Forward pass to get activations
-    _, activations = network(input)
+    with torch.set_grad_enabled(True):
+        _, activations = network(input)
 
     # Train feedback weights for each layer
     for i, layer in enumerate(network.dtp_layers):
         if i == len(network.dtp_layers) - 1:  # Skip last layer
             continue
 
-        feedback_loss = loss_fn.feedback_loss(
-            layer,
-            activations[i],
-            activations[i + 1]
-        )
-        total_feedback_loss += feedback_loss
+        if layer.requires_feedback_training:
+            feedback_loss = loss_fn.feedback_loss(
+                layer,
+                activations[i],
+                activations[i + 1]
+            )
+            total_feedback_loss += feedback_loss
 
-    total_feedback_loss.backward()
-    feedback_optimizer.step()
+    if total_feedback_loss.requires_grad:
+        total_feedback_loss.backward()
+        # Clip feedback gradients
+        torch.nn.utils.clip_grad_norm_(
+            [p for layer in network.dtp_layers for p in layer.feedback_layer.parameters()],
+            max_grad_norm
+        )
+        feedback_optimizer.step()
 
     # Train forward weights
     forward_optimizer.zero_grad()
     forward_loss = loss_fn.forward_loss(network, input, target)
     forward_loss.backward()
+
+    # Clip forward gradients
+    torch.nn.utils.clip_grad_norm_(
+        network.parameters(),
+        max_grad_norm
+    )
+
     forward_optimizer.step()
 
     return forward_loss.item(), total_feedback_loss.item()
@@ -103,7 +127,7 @@ if __name__ == "__main__":
     from environment import create_batch
     # parameters
     batch_size = 64
-    num_epochs = 100
+    num_epochs = 1000
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -113,11 +137,20 @@ if __name__ == "__main__":
     loss_fn = DTPLoss(DTPLossConfig())
 
     # Create optimizers
-    forward_optimizer = torch.optim.SGD(network.parameters(), lr=0.01)
+    # Create optimizers with more conservative settings
+    forward_optimizer = torch.optim.SGD(
+        network.parameters(),
+        lr=0.01,  # Reduced learning rate
+        momentum=0.9,
+        weight_decay=1e-4
+    )
+
     feedback_optimizer = torch.optim.SGD(
         [p for layer in network.dtp_layers
          for p in layer.feedback_layer.parameters()],
-        lr=0.01
+        lr=0.01,  # Reduced learning rate
+        momentum=0.9,
+        weight_decay=1e-4
     )
 
     for _ in range(num_epochs):
