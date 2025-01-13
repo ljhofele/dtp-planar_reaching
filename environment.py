@@ -1,21 +1,28 @@
 import numpy as np
 import torch
 from typing import Tuple, Optional
-
 from torch import Tensor
-
 from kinematics.planar_arms import PlanarArms
 
 
-def data_transform(thetas: np.ndarray,
-                   xy: np.ndarray,):
+def input_transform(thetas: np.ndarray,
+                    xy: np.ndarray, ):
     """
     Transforms angles in radians to sin and cos values and concatenates with xy coordinates
     :param thetas: angle in radians
     :param xy: cartesian coordinates
     :return: inputs and targets
     """
-    return np.concatenate((np.sin(thetas), np.cos(thetas), xy), axis=1)
+    return np.concatenate((np.sin(thetas), xy), axis=1)
+
+
+def inverse_thetas_transform(inputs: Tensor) -> np.ndarray:
+    """Returns the initial joint angles for the evaluation
+    :param inputs: input tensor in [batch_size, 4]
+    :return:
+    """
+    inputs = inputs.cpu().numpy()
+    return np.arcsin(inputs[:, :2])
 
 
 def create_batch(
@@ -27,21 +34,17 @@ def create_batch(
 
     init_thetas = np.array((init_shoulder_theta, init_elbow_theta))
 
-    delta_thatas, targets_xy = generate_random_coordinates(arm=arm,
+    delta_thetas, targets_xy = generate_random_coordinates(arm=arm,
                                                            initial_thetas=init_thetas,
                                                            num_movements=batch_size,
-                                                           return_thetas_radians=False)
-    # input for network
+                                                           return_thetas_radians=True)
+    # input for network (init_angles, target_position [in cartesian coordinates])
     init_thetas = np.repeat(init_thetas, batch_size).reshape((batch_size, -1))
-    input_batch = data_transform(thetas=init_thetas,
-                                 xy=targets_xy)
-
-    # target for network
-    target_batch = data_transform(thetas=delta_thatas,
+    input_batch = input_transform(thetas=init_thetas,
                                   xy=targets_xy)
 
-    return (torch.from_numpy(input_batch).float().to(device),  # input (batch_size, 6)
-            torch.from_numpy(target_batch).float().to(device))  # target (batch_size, 6)
+    return (torch.from_numpy(input_batch).float().to(device),  # input (batch_size, 4)
+            torch.from_numpy(delta_thetas).float().to(device))  # target (batch_size, 2)
 
 
 def generate_random_coordinates(arm: str,
@@ -69,7 +72,7 @@ def generate_random_coordinates(arm: str,
                                              radians=False)[:, -1]
 
     random_movement_thetas = []
-    random_changed_xy = []
+    random_target_xy = []
 
     while len(random_movement_thetas) < num_movements:
         # Generate random joint angles within limits
@@ -90,19 +93,16 @@ def generate_random_coordinates(arm: str,
                 theta_change = np.degrees(theta_change)
 
             # Normalize the xy coordinates
-            normalized_random_xy = norm_xy(current_pos, x_bounds=x_bounds, y_bounds=y_bounds)
-            normalized_init_xy = norm_xy(init_pos, x_bounds=x_bounds, y_bounds=y_bounds)
-
             random_movement_thetas.append(theta_change)
-            random_changed_xy.append(normalized_random_xy - normalized_init_xy)
+            random_target_xy.append(norm_xy(current_pos, x_bounds, y_bounds))
 
-    return np.array(random_movement_thetas), np.array(random_changed_xy)
+    return np.array(random_movement_thetas), np.array(random_target_xy)
 
 
 def norm_xy(xy: np.ndarray,
             x_bounds: Tuple[float, float],
             y_bounds: Tuple[float, float],
-            clip_borders_xy: float = 10.) -> np.ndarray:
+            clip_borders_xy: float = 0.0) -> np.ndarray:
     x_bounds = (x_bounds[0] + clip_borders_xy, x_bounds[1] - clip_borders_xy)
     y_bounds = (y_bounds[0] + clip_borders_xy, y_bounds[1] - clip_borders_xy)
 
@@ -119,6 +119,13 @@ def norm_xy(xy: np.ndarray,
     normalized_y = (xy[1] - y_mid) / y_half_range
 
     return np.array([normalized_x, normalized_y])
+
+
+def inverse_norm_xy(xy: np.ndarray,
+                    x_bounds: Tuple[float, float],
+                    y_bounds: Tuple[float, float],
+                    clip_borders_xy: float = 0.) -> np.ndarray:
+    pass
 
 
 if __name__ == "__main__":
