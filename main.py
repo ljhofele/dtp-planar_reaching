@@ -10,11 +10,13 @@ from kinematics.planar_arms import PlanarArms
 
 def create_simple_dtp_network(dim_input: int = 4, dim_output: int = 2) -> DTPNetwork:
     layers = [
-        nn.Linear(dim_input, 128),  # 6 input features (2 angles in sin/cos + 2D target)
+        nn.Linear(dim_input, 128),  # 4 input features (2 angles in sin + xy target)
         nn.ReLU(),
         nn.Linear(128, 64),
         nn.ReLU(),
-        nn.Linear(64, dim_output)    # 6 output features (delta angles + target position)
+        nn.Linear(64, 64),
+        nn.ReLU(),
+        nn.Linear(64, dim_output)    # 2 output features (delta angles)
     ]
 
     # Ensure all parameters have requires_grad=True
@@ -163,7 +165,7 @@ def train_network(
     # Initialize optimizers
     forward_optimizer = torch.optim.SGD(
         network.parameters(),
-        lr=0.01,  # Reduced learning rate
+        lr=0.05,
         momentum=0.9,
         weight_decay=1e-4
     )
@@ -171,7 +173,7 @@ def train_network(
     feedback_optimizer = torch.optim.SGD(
         [p for layer in network.dtp_layers
          for p in layer.feedback_layer.parameters()],
-        lr=0.01,  # Reduced learning rate
+        lr=0.05,
         momentum=0.9,
         weight_decay=1e-4
     )
@@ -272,7 +274,7 @@ if __name__ == "__main__":
         loss_fn=loss_fn,
         num_epochs=100_000,
         num_batches=10,
-        batch_size=16,
+        batch_size=64,
         arm="right",
         device=device,
         validation_interval=10_000

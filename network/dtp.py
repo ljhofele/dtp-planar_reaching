@@ -63,7 +63,7 @@ class DTPNetwork(nn.Module):
 
     def compute_targets(self,
                         activations: List[torch.Tensor],
-                        final_target: torch.Tensor,) -> List[torch.Tensor]:
+                        final_target: torch.Tensor, ) -> List[torch.Tensor]:
         """Compute layer-wise targets using DTP."""
         targets = [None] * len(activations)
         targets[-1] = final_target
@@ -132,9 +132,61 @@ class DTPLoss:
 
     def forward_loss(self,
                      network: DTPNetwork,
-                     input: torch.Tensor,
-                     target: torch.Tensor,
-                     norm_grad: bool = True) -> torch.Tensor:
+                     inputs: torch.Tensor,
+                     targets: torch.Tensor,) -> torch.Tensor:
+        """
+        Compute forward training loss for reaching.
+        """
+        # Forward pass
+        with torch.set_grad_enabled(True):
+            output, activations = network(inputs)
+
+        # Compute reaching error (L2 norm)
+        reaching_error = 0.5 * torch.mean((output - targets) ** 2)
+
+        # Set first target using reaching error gradient
+        temp_output = output.detach().clone()
+        temp_output.requires_grad_(True)
+
+        # Scale gradients to prevent explosion
+        grad_norm = torch.norm(reaching_error)
+        if grad_norm > 1.0:
+            reaching_error = reaching_error / grad_norm
+
+        output_target = output.detach() - self.config.beta * reaching_error
+
+        # Compute targets for all layers
+        targets = network.compute_targets(activations, output_target)
+
+        # Calculate layer-wise losses with stability measures
+        layer_losses = []
+        for i, (h, t) in enumerate(zip(activations[1:], targets[1:])):
+            if not h.requires_grad:
+                h.requires_grad_(True)
+
+            # Normalize activations and targets
+            h_norm = torch.norm(h)
+            t_norm = torch.norm(t)
+            if h_norm > 1.0:
+                h = h / h_norm
+            if t_norm > 1.0:
+                t = t / t_norm
+
+            # Calculate loss with numerical stability
+            loss = 0.5 * ((h - t) ** 2).view(h.size(0), -1)
+            loss = loss.sum(1).mean()  # Sum over features, mean over batch
+
+            # Add small epsilon to prevent exactly zero loss
+            loss = loss + 1e-8
+
+            layer_losses.append(loss)
+
+        return torch.sum(torch.stack(layer_losses))
+
+    def forward_loss_ce(self,
+                        network: DTPNetwork,
+                        input: torch.Tensor,
+                        target: torch.Tensor, ) -> torch.Tensor:
         """Compute forward training loss with numerical stability measures."""
         # Forward pass
         with torch.set_grad_enabled(True):
