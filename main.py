@@ -4,70 +4,38 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 from network.dtp import DTPNetwork, DTPLoss, DTPLossConfig
-from environment import create_batch, input_transform, inverse_thetas_transform
+from environment import create_batch, inverse_target_transform
 from kinematics.planar_arms import PlanarArms
-
-
-def create_simple_dtp_network(dim_input: int = 4, dim_output: int = 2) -> DTPNetwork:
-    layers = [
-        nn.Linear(dim_input, 128),  # 4 input features (2 angles in sin + xy target)
-        nn.ReLU(),
-        nn.Linear(128, 64),
-        nn.ReLU(),
-        nn.Linear(64, 64),
-        nn.ReLU(),
-        nn.Linear(64, dim_output)    # 2 output features (delta angles)
-    ]
-
-    # Ensure all parameters have requires_grad=True
-    for layer in layers:
-        if hasattr(layer, 'weight'):
-            layer.weight.requires_grad_(True)
-        if hasattr(layer, 'bias'):
-            layer.bias.requires_grad_(True)
-
-    return DTPNetwork(layers)
 
 
 def create_dtp_network(
         layer_dims: List[int],
-        activation_fn: Optional[str] = "relu",
-        final_activation: Optional[str] = None
+        activation_fn: Optional[str] = "relu"
 ) -> DTPNetwork:
-    """
-    Create a DTP network with customizable architecture.
-    """
-    # Dictionary mapping activation names to functions
+    """Create a DTP network."""
+
     activation_fns = {
         'relu': nn.ReLU(),
-        'tanh': nn.Tanh(),
-        'sigmoid': nn.Sigmoid(),
+        'leaky_relu': nn.LeakyReLU(0.1),  # Better for gradient flow
         'elu': nn.ELU(),
         None: nn.Identity()
     }
 
     if activation_fn not in activation_fns:
-        raise ValueError(f"Unsupported activation function: {activation_fn}. "
-                         f"Choose from {list(activation_fns.keys())}")
-
-    if final_activation not in activation_fns:
-        raise ValueError(f"Unsupported final activation: {final_activation}. "
-                         f"Choose from {list(activation_fns.keys())}")
+        raise ValueError(f"Unsupported activation function: {activation_fn}")
 
     layers = []
 
-    # Create layers with specified dimensions and activations
+    # Create layers with kaiming initialization
     for i in range(len(layer_dims) - 1):
-        # Add linear layer
-        layers.append(nn.Linear(layer_dims[i], layer_dims[i + 1]))
+        linear = nn.Linear(layer_dims[i], layer_dims[i + 1])
+        nn.init.kaiming_normal_(linear.weight, nonlinearity='relu')
+        nn.init.zeros_(linear.bias)
+        layers.append(linear)
 
-        # Add activation function
-        if i < len(layer_dims) - 2:  # Not last layer
-            if activation_fn:
-                layers.append(activation_fns[activation_fn])
-        else:  # Last layer
-            if final_activation:
-                layers.append(activation_fns[final_activation])
+        # Add activation except for last layer
+        if i < len(layer_dims) - 2 and activation_fn:
+            layers.append(activation_fns[activation_fn])
 
     return DTPNetwork(layers)
 
@@ -84,19 +52,6 @@ def train_epoch(
 ) -> Dict[str, float]:
     """
     Train the network for one epoch.
-
-    Args:
-        network: The DTP network
-        loss_fn: The DTP loss function
-        forward_optimizer: Optimizer for forward weights
-        feedback_optimizer: Optimizer for feedback weights
-        num_batches: Number of batches per epoch
-        batch_size: Size of each batch
-        arm: Which arm to train ('left' or 'right')
-        device: Device to train on
-
-    Returns:
-        Dictionary containing average losses for the epoch
     """
     network.train()
     total_forward_loss = 0.0
@@ -104,7 +59,7 @@ def train_epoch(
 
     for _ in range(num_batches):
         # Generate random reaching movements
-        inputs, targets = create_batch(
+        inputs, targets, _ = create_batch(
             arm=arm,
             batch_size=batch_size,
             device=device
@@ -165,7 +120,7 @@ def train_network(
     # Initialize optimizers
     forward_optimizer = torch.optim.SGD(
         network.parameters(),
-        lr=0.05,
+        lr=learning_rate,
         momentum=0.9,
         weight_decay=1e-4
     )
@@ -173,7 +128,7 @@ def train_network(
     feedback_optimizer = torch.optim.SGD(
         [p for layer in network.dtp_layers
          for p in layer.feedback_layer.parameters()],
-        lr=0.05,
+        lr=learning_rate,
         momentum=0.9,
         weight_decay=1e-4
     )
@@ -232,7 +187,7 @@ def evaluate_reaching(
     with torch.no_grad():
         for _ in range(num_tests):
             # Generate a single test movement
-            inputs, targets = create_batch(
+            inputs, targets, initial_thetas = create_batch(
                 arm=arm,
                 batch_size=1,
                 device=device
@@ -241,18 +196,17 @@ def evaluate_reaching(
             # Get network prediction
             outputs, _ = network(inputs)
 
-            # Convert network outputs back to angles and positions
-            target_delta_thetas = targets.cpu().numpy()
-            pred_delta_thetas = outputs.cpu().numpy()
+            # Convert network outputs and targets back to radians
+            target_delta_thetas = inverse_target_transform(targets.cpu().numpy())
+            pred_delta_thetas = inverse_target_transform(outputs.cpu().numpy())
 
             # Calculate reaching error
-            current_thetas = inverse_thetas_transform(inputs)
             target_xy = PlanarArms.forward_kinematics(arm=arm,
-                                                      thetas=PlanarArms.clip_values(current_thetas[0] + target_delta_thetas[0], radians=True),
+                                                      thetas=PlanarArms.clip_values(initial_thetas + target_delta_thetas[0], radians=True),
                                                       radians=True,
                                                       check_limits=False)[:, -1]
             pred_xy = PlanarArms.forward_kinematics(arm=arm,
-                                                    thetas=PlanarArms.clip_values(current_thetas[0] + pred_delta_thetas[0], radians=True),
+                                                    thetas=PlanarArms.clip_values(initial_thetas + pred_delta_thetas[0], radians=True),
                                                     radians=True,
                                                     check_limits=False)[:, -1]
 
@@ -265,19 +219,21 @@ def evaluate_reaching(
 if __name__ == "__main__":
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    network = create_simple_dtp_network().to(device)
+    network = create_dtp_network(
+        layer_dims=[4, 128, 64, 64, 2],
+        activation_fn="leaky_relu").to(device)
     loss_fn = DTPLoss(config=DTPLossConfig())
 
     # Training
     history = train_network(
         network=network,
         loss_fn=loss_fn,
-        num_epochs=100_000,
+        num_epochs=500_000,
         num_batches=10,
         batch_size=64,
         arm="right",
         device=device,
-        validation_interval=10_000
+        validation_interval=50_000,
     )
 
     # Final evaluation
