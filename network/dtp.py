@@ -6,13 +6,21 @@ from dataclasses import dataclass
 import numpy as np
 
 
+@dataclass
+class DTPLossConfig:
+    """Configuration for DTP loss calculation."""
+    beta: float = 0.2
+    noise_scale: float = 0.1
+    feedback_samples: int = 1
+
+
 class DTPLayer(nn.Module):
     """A layer in the DTP network with both forward and feedback pathways."""
 
     def __init__(self, forward_layer: nn.Module):
         super().__init__()
         self.forward_layer = forward_layer
-        # Initialize feedback layer as transpose of forward layer initially
+        # Initialize feedback layer
         self.feedback_layer = self._create_feedback_layer(forward_layer)
         self.requires_feedback_training = True
 
@@ -63,7 +71,7 @@ class DTPNetwork(nn.Module):
 
     def compute_targets(self,
                         activations: List[torch.Tensor],
-                        final_target: torch.Tensor,) -> List[torch.Tensor]:
+                        final_target: torch.Tensor) -> List[torch.Tensor]:
         """Compute layer-wise targets using DTP."""
         targets = [None] * len(activations)
         targets[-1] = final_target
@@ -79,19 +87,10 @@ class DTPNetwork(nn.Module):
             h_next = activations[i + 1]
 
             # Compute target using DTP formula
-            # t_i = h_i + G(t_next) - G(h_next)
             G = self.dtp_layers[i].feedback
             targets[i] = h_i + G(t_next) - G(h_next)
 
         return targets
-
-
-@dataclass
-class DTPLossConfig:
-    """Configuration for DTP loss calculation."""
-    beta: float = 0.1
-    noise_scale: float = 0.1
-    feedback_samples: int = 1
 
 
 class DTPLoss:
@@ -103,60 +102,61 @@ class DTPLoss:
     def feedback_loss(self,
                       layer: DTPLayer,
                       input: torch.Tensor,
-                      output: torch.Tensor,  # We are using L-DRL with noisy outputs from the forward pass
-                      ) -> torch.Tensor:
-        """Compute feedback training loss for a single layer."""
+                      output: torch.Tensor) -> torch.Tensor:
+        """
+        Compute feedback training loss for a single layer based on Ernoult et al's implementation.
+        """
         if not layer.requires_feedback_training:
             return torch.tensor(0.0, device=input.device)
 
-        batch_losses = []
-        for _ in range(self.config.feedback_samples):
-            # Add noise to input
-            noise = torch.randn_like(input) * self.config.noise_scale
-            noisy_input = input + noise
+        # Get the forward and feedback layers
+        layer_F = layer.forward_layer
+        layer_G = layer.feedback_layer
 
-            # Forward pass
-            noisy_output = layer(noisy_input)
+        # Compute initial reconstruction
+        r = layer_G(output)
 
-            # Feedback pass
-            reconstructed = layer.feedback(noisy_output)
+        # Input perturbation
+        dx = self.config.noise_scale * torch.randn_like(input)
+        with torch.no_grad():
+            y_noise = layer_F(input + dx)
+        r_noise = layer_G(y_noise)
+        dr = r_noise - r
 
-            # L-DRL loss
-            reconstruction_error = reconstructed - noisy_input
-            loss = torch.mean(0.5 * torch.sum(reconstruction_error ** 2, dim=1) -
-                              torch.sum(noise * reconstruction_error, dim=1))
+        # Output perturbation
+        dy = self.config.noise_scale * torch.randn_like(output)
+        r_noise_y = layer_G(output + dy)
+        dr_y = r_noise_y - r
 
-            batch_losses.append(loss)
+        # Compute loss terms
+        dr_loss = -2 * (dx * dr).flatten(1).sum(1).mean()
+        dy_loss = (dr_y ** 2).flatten(1).sum(1).mean()
 
-        return torch.mean(torch.stack(batch_losses))
+        return dr_loss + dy_loss
 
     def forward_loss(self,
                      network: DTPNetwork,
                      input: torch.Tensor,
-                     target: torch.Tensor,
-                     norm_grad: bool = True) -> torch.Tensor:
-        """Compute forward training loss with numerical stability measures."""
+                     target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute forward training loss with proper initialization and stability measures.
+        """
         # Forward pass
-        with torch.set_grad_enabled(True):
-            output, activations = network(input)
+        output, activations = network(input)
 
-        # Calculate initial target with gradient scaling
+        # Calculate initial target
         temp_output = output.detach().clone()
         temp_output.requires_grad_(True)
-        ce_loss = F.cross_entropy(temp_output, target, reduction="sum")
-        grad = torch.autograd.grad(
-            ce_loss,
-            temp_output,
-            only_inputs=True,
-            create_graph=False
-        )[0]
 
-        # Scale gradients to prevent explosion
-        grad_norm = torch.norm(grad)
-        if grad_norm > 1.0:
-            grad = grad / grad_norm
+        # Use MSE loss for regression
+        mse_loss = 0.5 * ((temp_output - target) ** 2).sum(dim=1).mean()
+        grad = torch.autograd.grad(mse_loss,
+                                   temp_output,
+                                   only_inputs=True,
+                                   create_graph=False)[0]
 
-        output_target = output.detach() + (-self.config.beta * grad)
+        # Compute first target
+        output_target = output.detach() - self.config.beta * grad
 
         # Compute targets for all layers
         targets = network.compute_targets(activations, output_target)
@@ -167,20 +167,9 @@ class DTPLoss:
             if not h.requires_grad:
                 h.requires_grad_(True)
 
-            # Normalize activations and targets
-            h_norm = torch.norm(h)
-            t_norm = torch.norm(t)
-            if h_norm > 1.0:
-                h = h / h_norm
-            if t_norm > 1.0:
-                t = t / t_norm
-
             # Calculate loss with numerical stability
-            loss = 0.5 * ((h - t) ** 2).view(h.size(0), -1)
-            loss = loss.sum(1).mean()  # Sum over features, mean over batch
-
-            # Add small epsilon to prevent exactly zero loss
-            loss = loss + 1e-8
+            loss = 0.5 * ((h - t) ** 2).view(h.size(0), -1).sum(1).mean()  # Sum over features, mean over batch
+            loss = loss + 1e-8  # Add small epsilon to prevent exactly zero loss
 
             layer_losses.append(loss)
 
