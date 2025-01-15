@@ -196,6 +196,7 @@ def evaluate_reaching(
             # Get network prediction
             outputs, _ = network(inputs)
 
+            tqdm.write(f"Targets: {targets}, Predictions: {outputs}")
             # Convert network outputs and targets back to radians
             target_delta_thetas = inverse_target_transform(targets.cpu().numpy())
             pred_delta_thetas = inverse_target_transform(outputs.cpu().numpy())
@@ -228,12 +229,12 @@ if __name__ == "__main__":
     history = train_network(
         network=network,
         loss_fn=loss_fn,
-        num_epochs=500_000,
+        num_epochs=100_000,
         num_batches=10,
-        batch_size=64,
+        batch_size=32,
         arm="right",
         device=device,
-        validation_interval=50_000,
+        validation_interval=5_000,
     )
 
     # Final evaluation

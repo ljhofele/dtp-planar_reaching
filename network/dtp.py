@@ -9,7 +9,7 @@ import numpy as np
 @dataclass
 class DTPLossConfig:
     """Configuration for DTP loss calculation."""
-    beta: float = 0.1
+    beta: float = 0.2
     noise_scale: float = 0.1
     feedback_samples: int = 1
 
@@ -155,11 +155,6 @@ class DTPLoss:
                                    only_inputs=True,
                                    create_graph=False)[0]
 
-        # Scale gradients to prevent explosion
-        grad_norm = torch.norm(grad)
-        if grad_norm > 1.0:
-            grad = grad / grad_norm
-
         # Compute first target
         output_target = output.detach() - self.config.beta * grad
 
@@ -171,14 +166,6 @@ class DTPLoss:
         for i, (h, t) in enumerate(zip(activations[1:], targets[1:])):
             if not h.requires_grad:
                 h.requires_grad_(True)
-
-            # Normalize activations and targets
-            h_norm = torch.norm(h)
-            t_norm = torch.norm(t)
-            if h_norm > 1.0:
-                h = h / h_norm
-            if t_norm > 1.0:
-                t = t / t_norm
 
             # Calculate loss with numerical stability
             loss = 0.5 * ((h - t) ** 2).view(h.size(0), -1).sum(1).mean()  # Sum over features, mean over batch

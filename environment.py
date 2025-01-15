@@ -18,7 +18,7 @@ def input_transform(thetas: np.ndarray,
     """
     # For both joints, we normalize using the same limits since they're identical
     angles_normalized = 2 * (thetas - PlanarArms.l_upper_arm_limit) / (
-                PlanarArms.u_upper_arm_limit - PlanarArms.l_upper_arm_limit) - 1
+            PlanarArms.u_upper_arm_limit - PlanarArms.l_upper_arm_limit) - 1
 
     # Normalize xy coordinates using existing function
     xy_normalized = norm_xy(xy)
@@ -38,7 +38,7 @@ def inverse_input_transform(inputs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]
 
     # Convert normalized angles back to radians
     thetas = (angles_norm + 1) / 2 * (
-                PlanarArms.u_upper_arm_limit - PlanarArms.l_upper_arm_limit) + PlanarArms.l_upper_arm_limit
+            PlanarArms.u_upper_arm_limit - PlanarArms.l_upper_arm_limit) + PlanarArms.l_upper_arm_limit
 
     # Denormalize xy coordinates
     x_mid = (PlanarArms.x_limits[0] + PlanarArms.x_limits[1]) / 2
@@ -101,7 +101,7 @@ def create_batch(
                                                            return_thetas_radians=True)
 
     # input for network (init_angles, target_position [in cartesian coordinates])
-    batched_init_thetas = np.repeat(init_thetas, batch_size).reshape((batch_size, -1))
+    batched_init_thetas = np.tile(init_thetas, (batch_size, 1))
     input_batch = input_transform(thetas=batched_init_thetas,
                                   xy=targets_xy)
 
@@ -109,6 +109,14 @@ def create_batch(
     return (torch.from_numpy(input_batch).float().to(device),  # input (batch_size, 4)  -> initial state and goal
             torch.from_numpy(target_batch).float().to(device),  # target (batch_size, 2) -> action to reach target xy from initial position
             init_thetas)  # initial joint angles in radians
+
+
+def create_batches(
+        arm: str,
+        batch_size: int,
+        num_batches: int,) -> Tuple[Tensor, Tensor, np.ndarray]:
+
+    pass
 
 
 def generate_random_coordinates(arm: str,
@@ -141,12 +149,12 @@ def generate_random_coordinates(arm: str,
         random_thetas = np.random.uniform(lower_arm_limits, upper_arm_limits)
 
         # Calculate end effector position for these angles
-        current_pos = PlanarArms.forward_kinematics(arm=arm,
-                                                    thetas=random_thetas,
-                                                    radians=True)[:, -1]
+        target_pos = PlanarArms.forward_kinematics(arm=arm,
+                                                   thetas=random_thetas,
+                                                   radians=True)[:, -1]
 
         # Calculate distance from initial position
-        distance = np.linalg.norm(current_pos - init_pos)
+        distance = np.linalg.norm(target_pos - init_pos)
 
         if distance >= min_distance:
             # Calculate change in joint angles
@@ -156,14 +164,14 @@ def generate_random_coordinates(arm: str,
 
             # Normalize the xy coordinates
             random_movement_thetas.append(theta_change)
-            random_target_xy.append(current_pos)
+            random_target_xy.append(target_pos)
 
     return np.array(random_movement_thetas), np.array(random_target_xy)
 
 
 def norm_xy(xy: np.ndarray,
             x_bounds: Tuple[float, float] = PlanarArms.x_limits,
-            y_bounds: Tuple[float, float] = PlanarArms.y_limits,) -> np.ndarray:
+            y_bounds: Tuple[float, float] = PlanarArms.y_limits, ) -> np.ndarray:
     # Calculate the midpoints of x and y ranges
     x_mid = (x_bounds[0] + x_bounds[1]) / 2
     y_mid = (y_bounds[0] + y_bounds[1]) / 2
@@ -180,13 +188,4 @@ def norm_xy(xy: np.ndarray,
 
 
 if __name__ == "__main__":
-    thetas, xys = generate_random_coordinates(arm='right',
-                                              initial_thetas=np.radians([90., 90.]),
-                                              num_movements=100,)
-
-    print(thetas)
-    print(xys)
-
-    inputs, targets, _ = create_batch(arm='right', batch_size=100, device=torch.device('cpu'))
-    print(inputs.shape, targets.shape)
-
+    inputs, targets, init_thetas = create_batch(arm='right', batch_size=100, device=torch.device('cpu'))
