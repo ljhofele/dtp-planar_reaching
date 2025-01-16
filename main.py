@@ -4,7 +4,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 from network.dtp import DTPNetwork, DTPLoss, DTPLossConfig
-from environment import create_batch, inverse_target_transform
+from environment import MovementBuffer, inverse_target_transform, create_batch
 from kinematics.planar_arms import PlanarArms
 
 
@@ -45,9 +45,9 @@ def train_epoch(
         loss_fn: DTPLoss,
         forward_optimizer: torch.optim.Optimizer,
         feedback_optimizer: torch.optim.Optimizer,
+        buffer: MovementBuffer,
         num_batches: int,
         batch_size: int,
-        arm: str,
         device: torch.device
 ) -> Dict[str, float]:
     """
@@ -58,12 +58,8 @@ def train_epoch(
     total_feedback_loss = 0.0
 
     for _ in range(num_batches):
-        # Generate random reaching movements
-        inputs, targets, _ = create_batch(
-            arm=arm,
-            batch_size=batch_size,
-            device=device
-        )
+        # Generate a single batch
+        inputs, targets, _ = buffer.get_batches(batch_size=batch_size)
 
         # Train feedback weights
         feedback_optimizer.zero_grad()
@@ -108,6 +104,7 @@ def train_network(
         num_epochs: int,
         num_batches: int,
         batch_size: int,
+        trainings_buffer_size: int,
         arm: str,
         device: torch.device,
         learning_rate: float = 0.01,
@@ -133,6 +130,14 @@ def train_network(
         weight_decay=1e-4
     )
 
+    # Initialize dataset
+    trainings_buffer = MovementBuffer(
+        arm=arm,
+        buffer_size=trainings_buffer_size,
+        device=device
+    )
+
+    # Initialize history
     history = {
         'forward_loss': [],
         'feedback_loss': [],
@@ -140,20 +145,26 @@ def train_network(
     }
 
     for epoch in tqdm(range(num_epochs), desc="Training"):
+        # Fill buffer with movements
+        trainings_buffer.fill_buffer()
+
         # Train for one epoch
         epoch_losses = train_epoch(
             network=network,
             loss_fn=loss_fn,
             forward_optimizer=forward_optimizer,
             feedback_optimizer=feedback_optimizer,
+            buffer=trainings_buffer,
             num_batches=num_batches,
             batch_size=batch_size,
-            arm=arm,
             device=device
         )
 
         history['forward_loss'].append(epoch_losses['forward_loss'])
         history['feedback_loss'].append(epoch_losses['feedback_loss'])
+
+        # Clear buffer
+        trainings_buffer.clear_buffer()
 
         # Run validation periodically
         if (epoch + 1) % validation_interval == 0:
@@ -189,14 +200,12 @@ def evaluate_reaching(
             # Generate a single test movement
             inputs, targets, initial_thetas = create_batch(
                 arm=arm,
-                batch_size=1,
                 device=device
             )
 
             # Get network prediction
             outputs, _ = network(inputs)
 
-            tqdm.write(f"Targets: {targets}, Predictions: {outputs}")
             # Convert network outputs and targets back to radians
             target_delta_thetas = inverse_target_transform(targets.cpu().numpy())
             pred_delta_thetas = inverse_target_transform(outputs.cpu().numpy())
@@ -229,12 +238,13 @@ if __name__ == "__main__":
     history = train_network(
         network=network,
         loss_fn=loss_fn,
-        num_epochs=100_000,
-        num_batches=10,
-        batch_size=32,
+        trainings_buffer_size=5_000,
+        num_epochs=10_000,
+        num_batches=100,
+        batch_size=64,
         arm="right",
         device=device,
-        validation_interval=5_000,
+        validation_interval=100,
     )
 
     # Final evaluation
