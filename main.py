@@ -48,7 +48,8 @@ def train_epoch(
         buffer: MovementBuffer,
         num_batches: int,
         batch_size: int,
-        device: torch.device
+        K_updates: int = 1,
+        device: torch.device = torch.device('cpu'),
 ) -> Dict[str, float]:
     """
     Train the network for one epoch.
@@ -244,7 +245,7 @@ if __name__ == "__main__":
         batch_size=64,
         arm="right",
         device=device,
-        validation_interval=100,
+        validation_interval=1_000,
     )
 
     # Final evaluation
