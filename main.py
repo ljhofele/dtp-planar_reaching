@@ -108,7 +108,7 @@ def train_network(
         trainings_buffer_size: int,
         arm: str,
         device: torch.device,
-        learning_rate: float = 0.01,
+        learning_rate: float = 1e-4,
         validation_interval: int = 10
 ) -> Dict[str, List[float]]:
     """
@@ -228,31 +228,53 @@ def evaluate_reaching(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--arm', type=str, default="right"
+                        , choices=["right", "left"])
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--num_batches', type=int, default=100)
+    parser.add_argument('--num_epochs', type=int, default=10_000)
+    parser.add_argument('--trainings_buffer_size', type=int, default=5_000)
+    parser.add_argument('--validation_interval', type=int, default=1000)
+    parser.add_argument('--device', type=str, default="cpu")
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--beta', type=float, default=0.9)
+    parser.add_argument('--noise_scale', type=float, default=0.1)
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
+    if device == "cuda" and not torch.cuda.is_available():
+        device = torch.device("cpu")
+    print(f'Pytorch version: {torch.__version__} running on {device}')
+
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network = create_dtp_network(
-        layer_dims=[4, 128, 64, 64, 2],
+        layer_dims=[4, 128, 64, 2],
         activation_fn="leaky_relu").to(device)
-    loss_fn = DTPLoss(config=DTPLossConfig())
+    loss_fn = DTPLoss(config=DTPLossConfig(beta=args.beta, noise_scale=args.noise_scale))
 
     # Training
     history = train_network(
         network=network,
         loss_fn=loss_fn,
-        trainings_buffer_size=5_000,
-        num_epochs=10_000,
-        num_batches=100,
-        batch_size=64,
-        arm="right",
+        trainings_buffer_size=args.trainings_buffer_size,
+        num_epochs=args.num_epochs,
+        num_batches=args.num_batches,
+        batch_size=args.batch_size,
+        arm=args.arm,
         device=device,
-        validation_interval=1_000,
+        validation_interval=args.validation_interval,
+        learning_rate=args.lr
     )
 
     # Final evaluation
     final_error = evaluate_reaching(
         network=network,
-        num_tests=1000,
-        arm="right",
+        num_tests=1_000,
+        arm=args.arm,
         device=device
     )
     tqdm.write(f"Final reaching error: {final_error:.2f}mm")
