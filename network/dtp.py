@@ -9,7 +9,7 @@ import numpy as np
 @dataclass
 class DTPLossConfig:
     """Configuration for DTP loss calculation."""
-    beta: float = 0.2
+    beta: float = 0.9
     noise_scale: float = 0.1
     feedback_samples: int = 1
 
@@ -139,10 +139,11 @@ class DTPLoss:
                      input: torch.Tensor,
                      target: torch.Tensor) -> torch.Tensor:
         """
-        Compute forward training loss with proper initialization and stability measures.
+        Compute forward training loss with local gradient flow.
         """
-        # Forward pass
-        output, activations = network(input)
+        # Initial forward pass without gradients
+        with torch.no_grad():
+            output, activations = network(input)
 
         # Calculate initial target
         temp_output = output.detach().clone()
@@ -155,22 +156,26 @@ class DTPLoss:
                                    only_inputs=True,
                                    create_graph=False)[0]
 
-        # Compute first target
-        output_target = output.detach() - self.config.beta * grad
+        # Compute targets without gradients
+        with torch.no_grad():
+            output_target = output - self.config.beta * grad
+            targets = network.compute_targets(activations, output_target)
 
-        # Compute targets for all layers
-        targets = network.compute_targets(activations, output_target)
+        # Calculate layer-wise losses with locality
+        total_loss = 0
+        for i, layer in enumerate(network.dtp_layers[:-1]):  # Skip last layer
+            # Get input to this layer (detached)
+            layer_input = activations[i].detach()
 
-        # Calculate layer-wise losses with stability measures
-        layer_losses = []
-        for i, (h, t) in enumerate(zip(activations[1:], targets[1:])):
-            if not h.requires_grad:
-                h.requires_grad_(True)
+            # Recompute this layer's output with grad enabled
+            with torch.set_grad_enabled(True):
+                layer_output = layer(layer_input)
+                layer_target = targets[i + 1].detach()  # Detach target
 
-            # Calculate loss with numerical stability
-            loss = 0.5 * ((h - t) ** 2).view(h.size(0), -1).sum(1).mean()  # Sum over features, mean over batch
-            loss = loss + 1e-8  # Add small epsilon to prevent exactly zero loss
+                # Calculate local loss
+                loss = 0.5 * ((layer_output - layer_target) ** 2).view(layer_output.size(0), -1).sum(1).mean()
+                loss = loss + 1e-8  # Stability measure
 
-            layer_losses.append(loss)
+                total_loss = total_loss + loss
 
-        return torch.sum(torch.stack(layer_losses))
+        return total_loss
