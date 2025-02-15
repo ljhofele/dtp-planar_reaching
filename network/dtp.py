@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Dict
 from dataclasses import dataclass
-import numpy as np
 
 
 @dataclass
@@ -11,34 +9,27 @@ class DTPLossConfig:
     """Configuration for DTP loss calculation."""
     beta: float = 0.9
     noise_scale: float = 0.1
-    feedback_samples: int = 1
+    K_iterations: int = 1
 
 
 class DTPLayer(nn.Module):
-    """A layer in the DTP network with both forward and feedback pathways."""
+    """An improved DTP layer with local gradient control."""
 
     def __init__(self, forward_layer: nn.Module):
         super().__init__()
         self.forward_layer = forward_layer
-        # Initialize feedback layer
         self.feedback_layer = self._create_feedback_layer(forward_layer)
         self.requires_feedback_training = True
 
     def _create_feedback_layer(self, forward_layer: nn.Module) -> nn.Module:
         """Creates a feedback layer matching the forward layer architecture."""
         if isinstance(forward_layer, nn.Linear):
-            feedback = nn.Linear(forward_layer.out_features, forward_layer.in_features, bias=True)
+            feedback = nn.Linear(forward_layer.out_features,
+                                 forward_layer.in_features,
+                                 bias=True)
+            # Initialize feedback weights
             with torch.no_grad():
                 feedback.weight.copy_(forward_layer.weight.t())
-            return feedback
-        elif isinstance(forward_layer, nn.Conv2d):
-            feedback = nn.ConvTranspose2d(
-                forward_layer.out_channels,
-                forward_layer.in_channels,
-                forward_layer.kernel_size,
-                stride=forward_layer.stride,
-                padding=forward_layer.padding
-            )
             return feedback
         else:
             self.requires_feedback_training = False
@@ -46,22 +37,41 @@ class DTPLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the layer."""
+        # Detach input to prevent global gradient flow
+        x = x.detach()
         return self.forward_layer(x)
 
     def feedback(self, x: torch.Tensor) -> torch.Tensor:
         """Feedback pass through the layer."""
+        # Detach input to prevent global gradient flow
+        x = x.detach()
         return self.feedback_layer(x)
+
+    def compute_target(self,
+                       current_activation: torch.Tensor,
+                       next_layer_target: torch.Tensor,
+                       next_layer_activation: torch.Tensor) -> torch.Tensor:
+        """Compute layer target using difference target propagation."""
+        # All inputs should be detached to ensure local training
+        current_activation = current_activation.detach()
+        next_layer_target = next_layer_target.detach()
+        next_layer_activation = next_layer_activation.detach()
+
+        # Apply difference correction
+        target = self.feedback(next_layer_target) - \
+                 (self.feedback(next_layer_activation) - current_activation)
+        return target
 
 
 class DTPNetwork(nn.Module):
-    """Network implementing Difference Target Propagation."""
+    """Neural network using DTP layers."""
 
     def __init__(self, layers: List[nn.Module]):
         super().__init__()
         self.dtp_layers = nn.ModuleList([DTPLayer(layer) for layer in layers])
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Forward pass returning both output and all intermediate activations."""
+        """Forward pass returning both output and intermediate activations."""
         activations = [x]
         current = x
         for layer in self.dtp_layers:
@@ -81,20 +91,17 @@ class DTPNetwork(nn.Module):
             if i == 0:  # No target needed for input layer
                 continue
 
-            # Get activations and target for current layer
-            h_i = activations[i]
-            t_next = targets[i + 1]
-            h_next = activations[i + 1]
-
-            # Compute target using DTP formula
-            G = self.dtp_layers[i].feedback
-            targets[i] = h_i + G(t_next) - G(h_next)
+            targets[i] = self.dtp_layers[i].compute_target(
+                activations[i],
+                targets[i + 1],
+                activations[i + 1]
+            )
 
         return targets
 
 
 class DTPLoss:
-    """Loss functions for training DTP networks."""
+    """Loss functions for training DTP networks with difference reconstruction loss."""
 
     def __init__(self, config: DTPLossConfig):
         self.config = config
@@ -104,78 +111,139 @@ class DTPLoss:
                       input: torch.Tensor,
                       output: torch.Tensor) -> torch.Tensor:
         """
-        Compute feedback training loss for a single layer based on Ernoult et al's implementation.
+        Compute feedback training loss for a single layer using difference reconstruction loss.
+        Since gradient control is handled at layer level, this focuses purely on the DRL calculation.
         """
         if not layer.requires_feedback_training:
             return torch.tensor(0.0, device=input.device)
 
-        # Get the forward and feedback layers
-        layer_F = layer.forward_layer
-        layer_G = layer.feedback_layer
+        # Generate noise samples
+        noise_input = torch.randn_like(input) * self.config.noise_scale
+        noise_output = torch.randn_like(output) * self.config.noise_scale
 
-        # Compute initial reconstruction
-        r = layer_G(output)
+        # Forward pass with noise
+        noisy_input = input + noise_input
 
-        # Input perturbation
-        dx = self.config.noise_scale * torch.randn_like(input)
-        with torch.no_grad():
-            y_noise = layer_F(input + dx)
-        r_noise = layer_G(y_noise)
-        dr = r_noise - r
+        # Get baseline reconstruction
+        baseline_reconstruction = layer.feedback_layer(output)
 
-        # Output perturbation
-        dy = self.config.noise_scale * torch.randn_like(output)
-        r_noise_y = layer_G(output + dy)
-        dr_y = r_noise_y - r
+        # Reconstruction through forward-feedback loop
+        reconstruction_noise = layer.feedback_layer(
+            layer.forward_layer(noisy_input)
+        )
 
-        # Compute loss terms
-        dr_loss = -2 * (dx * dr).flatten(1).sum(1).mean()
-        dy_loss = (dr_y ** 2).flatten(1).sum(1).mean()
+        # Output perturbation reconstruction
+        perturbed_output = output + noise_output
+        reconstruction_output = layer.feedback_layer(perturbed_output)
 
-        return dr_loss + dy_loss
+        # First term: input perturbation loss
+        first_term = -2 * (noise_input * (reconstruction_noise - baseline_reconstruction)).sum(1).mean()
+
+        # Second term: output perturbation loss
+        second_term = torch.square(reconstruction_output - baseline_reconstruction).sum(1).mean()
+
+        return first_term + second_term
 
     def forward_loss(self,
                      network: DTPNetwork,
                      input: torch.Tensor,
                      target: torch.Tensor) -> torch.Tensor:
         """
-        Compute forward training loss with local gradient flow.
+        Compute forward training loss with local targets.
+        Gradient control is now handled by the layers, simplifying the loss calculation.
         """
-        # Initial forward pass without gradients
-        with torch.no_grad():
-            output, activations = network(input)
+        # Forward pass
+        output, activations = network(input)
 
-        # Calculate initial target
-        temp_output = output.detach().clone()
-        temp_output.requires_grad_(True)
-
-        # Use MSE loss for regression
-        mse_loss = 0.5 * ((temp_output - target) ** 2).sum(dim=1).mean()
+        # Initial MSE loss
+        mse_loss = 0.5 * ((output - target) ** 2).sum(dim=1).mean()
         grad = torch.autograd.grad(mse_loss,
-                                   temp_output,
+                                   output,
                                    only_inputs=True,
                                    create_graph=False)[0]
 
-        # Compute targets without gradients
-        with torch.no_grad():
-            output_target = output - self.config.beta * grad
-            targets = network.compute_targets(activations, output_target)
+        # Compute output target
+        output_target = output - self.config.beta * grad
 
-        # Calculate layer-wise losses with locality
-        total_loss = 0
+        # Get targets for all layers
+        targets = network.compute_targets(activations, output_target)
+
+        # Calculate layer-wise losses
+        total_loss = torch.tensor(0.0, device=input.device)
         for i, layer in enumerate(network.dtp_layers[:-1]):  # Skip last layer
-            # Get input to this layer (detached)
-            layer_input = activations[i].detach()
+            layer_output = activations[i + 1]
+            layer_target = targets[i + 1]
 
-            # Recompute this layer's output with grad enabled
-            with torch.set_grad_enabled(True):
-                layer_output = layer(layer_input)
-                layer_target = targets[i + 1].detach()  # Detach target
-
-                # Calculate local loss
-                loss = 0.5 * ((layer_output - layer_target) ** 2).view(layer_output.size(0), -1).sum(1).mean()
-                loss = loss + 1e-8  # Stability measure
-
-                total_loss = total_loss + loss
+            # Local loss for this layer
+            layer_loss = 0.5 * ((layer_output - layer_target) ** 2).sum(1).mean()
+            total_loss = total_loss + layer_loss
 
         return total_loss
+
+    def train_feedback_weights(self,
+                               layer: DTPLayer,
+                               optimizer: torch.optim.Optimizer,
+                               input: torch.Tensor,
+                               output: torch.Tensor) -> float:
+        """
+        Train feedback weights for a single layer over multiple iterations.
+        Returns the final loss value.
+        """
+        final_loss = 0.0
+        for i in range(self.config.K_iterations):
+            optimizer.zero_grad()
+            loss = self.feedback_loss(layer, input, output)
+            # On all but the last iteration, retain the graph
+            retain_graph = (i < self.config.K_iterations - 1)
+            loss.backward(retain_graph=retain_graph)
+            optimizer.step()
+            final_loss = loss.item()
+
+            # Clear memory between iterations if needed
+            if not retain_graph:
+                del loss
+        return final_loss
+
+    def train_epoch(self,
+                    network: DTPNetwork,
+                    forward_optimizer: torch.optim.Optimizer,
+                    feedback_optimizers: Dict[int, torch.optim.Optimizer],
+                    dataloader: torch.utils.data.DataLoader,
+                    device: torch.device) -> Dict[str, float]:
+        """
+        Train for one epoch, handling both forward and feedback weight updates.
+        Returns dictionary of average losses.
+        """
+        total_forward_loss = 0.0
+        total_feedback_loss = 0.0
+        num_batches = 0
+
+        for batch_input, batch_target in dataloader:
+            batch_input = batch_input.to(device)
+            batch_target = batch_target.to(device)
+
+            # Train feedback weights first
+            output, activations = network(batch_input)
+            for i, layer in enumerate(network.dtp_layers[:-1]):  # Skip last layer
+                if layer.requires_feedback_training:
+                    loss = self.train_feedback_weights(
+                        layer,
+                        feedback_optimizers[i],
+                        activations[i],
+                        activations[i + 1]
+                    )
+                    total_feedback_loss += loss
+
+            # Then train forward weights
+            forward_optimizer.zero_grad()
+            forward_loss = self.forward_loss(network, batch_input, batch_target)
+            forward_loss.backward()
+            forward_optimizer.step()
+
+            total_forward_loss += forward_loss.item()
+            num_batches += 1
+
+        return {
+            'forward_loss': total_forward_loss / num_batches,
+            'feedback_loss': total_feedback_loss / num_batches
+        }

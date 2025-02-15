@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from tqdm import tqdm
 from network.dtp import DTPNetwork, DTPLoss, DTPLossConfig
 from environment import MovementBuffer, inverse_target_transform, create_batch
@@ -16,7 +16,7 @@ def create_dtp_network(
 
     activation_fns = {
         'relu': nn.ReLU(),
-        'leaky_relu': nn.LeakyReLU(0.1),  # Better for gradient flow
+        'leaky_relu': nn.LeakyReLU(0.1),
         'elu': nn.ELU(),
         None: nn.Identity()
     }
@@ -44,15 +44,13 @@ def train_epoch(
         network: DTPNetwork,
         loss_fn: DTPLoss,
         forward_optimizer: torch.optim.Optimizer,
-        feedback_optimizer: torch.optim.Optimizer,
+        feedback_optimizers: Dict[int, torch.optim.Optimizer],
         buffer: MovementBuffer,
         num_batches: int,
         batch_size: int,
-        K_updates: int = 1,
-        device: torch.device = torch.device('cpu'),
 ) -> Dict[str, float]:
     """
-    Train the network for one epoch.
+    Train the network for one epoch using the movement buffer.
     """
     network.train()
     total_forward_loss = 0.0
@@ -62,27 +60,20 @@ def train_epoch(
         # Generate a single batch
         inputs, targets, _ = buffer.get_batches(batch_size=batch_size)
 
-        # Train feedback weights
-        feedback_optimizer.zero_grad()
-        total_fb_loss = torch.tensor(0.0, device=device)
-
-        # Forward pass to get activations
-        _, activations = network(inputs)
+        # Train feedback weights first
+        output, activations = network(inputs)
+        batch_feedback_loss = 0.0
 
         # Train feedback weights for each layer
-        for i, layer in enumerate(network.dtp_layers):
-            if i == len(network.dtp_layers) - 1:  # Skip last layer
-                continue
-
-            feedback_loss = loss_fn.feedback_loss(
-                layer,
-                activations[i],
-                activations[i + 1]
-            )
-            total_fb_loss += feedback_loss
-
-        total_fb_loss.backward()
-        feedback_optimizer.step()
+        for i, layer in enumerate(network.dtp_layers[:-1]):  # Skip last layer
+            if i in feedback_optimizers:  # Only train layers that have feedback optimizers
+                layer_loss = loss_fn.train_feedback_weights(
+                    layer=layer,
+                    optimizer=feedback_optimizers[i],
+                    input=activations[i],
+                    output=activations[i + 1]
+                )
+                batch_feedback_loss += layer_loss
 
         # Train forward weights
         forward_optimizer.zero_grad()
@@ -91,7 +82,7 @@ def train_epoch(
         forward_optimizer.step()
 
         total_forward_loss += forward_loss.item()
-        total_feedback_loss += total_fb_loss.item()
+        total_feedback_loss += batch_feedback_loss
 
     return {
         'forward_loss': total_forward_loss / num_batches,
@@ -113,23 +104,27 @@ def train_network(
 ) -> Dict[str, List[float]]:
     """
     Train the network for multiple epochs with validation.
-
     """
     # Initialize optimizers
     forward_optimizer = torch.optim.SGD(
         network.parameters(),
         lr=learning_rate,
         momentum=0.9,
-        weight_decay=1e-4
+        weight_decay=1e-5
     )
 
-    feedback_optimizer = torch.optim.SGD(
-        [p for layer in network.dtp_layers
-         for p in layer.feedback_layer.parameters()],
-        lr=learning_rate,
-        momentum=0.9,
-        weight_decay=1e-4
-    )
+    # Create separate optimizers for each layer's feedback weights
+    feedback_optimizers = {}
+    for i, layer in enumerate(network.dtp_layers[:-1]):  # Skip last layer
+        if layer.requires_feedback_training:
+            params = list(layer.feedback_layer.parameters())
+            if params:  # Only create optimizer if there are parameters to train
+                feedback_optimizers[i] = torch.optim.SGD(
+                    params,
+                    lr=learning_rate,
+                    momentum=0.9,
+                    weight_decay=1e-5
+                )
 
     # Initialize dataset
     trainings_buffer = MovementBuffer(
@@ -154,11 +149,10 @@ def train_network(
             network=network,
             loss_fn=loss_fn,
             forward_optimizer=forward_optimizer,
-            feedback_optimizer=feedback_optimizer,
+            feedback_optimizers=feedback_optimizers,
             buffer=trainings_buffer,
             num_batches=num_batches,
             batch_size=batch_size,
-            device=device
         )
 
         history['forward_loss'].append(epoch_losses['forward_loss'])
@@ -212,14 +206,18 @@ def evaluate_reaching(
             pred_delta_thetas = inverse_target_transform(outputs.cpu().numpy())
 
             # Calculate reaching error
-            target_xy = PlanarArms.forward_kinematics(arm=arm,
-                                                      thetas=PlanarArms.clip_values(initial_thetas + target_delta_thetas[0], radians=True),
-                                                      radians=True,
-                                                      check_limits=False)[:, -1]
-            pred_xy = PlanarArms.forward_kinematics(arm=arm,
-                                                    thetas=PlanarArms.clip_values(initial_thetas + pred_delta_thetas[0], radians=True),
-                                                    radians=True,
-                                                    check_limits=False)[:, -1]
+            target_xy = PlanarArms.forward_kinematics(
+                arm=arm,
+                thetas=PlanarArms.clip_values(initial_thetas + target_delta_thetas[0], radians=True),
+                radians=True,
+                check_limits=False
+            )[:, -1]
+            pred_xy = PlanarArms.forward_kinematics(
+                arm=arm,
+                thetas=PlanarArms.clip_values(initial_thetas + pred_delta_thetas[0], radians=True),
+                radians=True,
+                check_limits=False
+            )[:, -1]
 
             error = np.linalg.norm(target_xy - pred_xy)
             total_error += error
@@ -231,30 +229,41 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--arm', type=str, default="right"
-                        , choices=["right", "left"])
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--arm', type=str, default="right", choices=["right", "left"])
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_batches', type=int, default=100)
-    parser.add_argument('--num_epochs', type=int, default=10_000)
+    parser.add_argument('--num_epochs', type=int, default=5_000)
     parser.add_argument('--trainings_buffer_size', type=int, default=5_000)
-    parser.add_argument('--validation_interval', type=int, default=1000)
+    parser.add_argument('--validation_interval', type=int, default=50)
     parser.add_argument('--device', type=str, default="cpu")
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--beta', type=float, default=0.9)
-    parser.add_argument('--noise_scale', type=float, default=0.1)
+    parser.add_argument('--beta', type=float, default=0.5)
+    parser.add_argument('--noise_scale', type=float, default=0.05)
+    parser.add_argument('--K_iterations', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    if device == "cuda" and not torch.cuda.is_available():
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    if device.type == "cuda" and not torch.cuda.is_available():
         device = torch.device("cpu")
     print(f'Pytorch version: {torch.__version__} running on {device}')
 
     # Setup
     network = create_dtp_network(
-        layer_dims=[4, 128, 64, 2],
-        activation_fn="leaky_relu").to(device)
-    loss_fn = DTPLoss(config=DTPLossConfig(beta=args.beta, noise_scale=args.noise_scale))
+        layer_dims=[4, 128, 64, 32, 2],
+        activation_fn="elu"
+    ).to(device)
+
+    loss_fn = DTPLoss(
+        config=DTPLossConfig(
+            beta=args.beta,
+            noise_scale=args.noise_scale,
+            K_iterations=args.K_iterations  # Number of feedback training iterations per batch
+        )
+    )
 
     # Training
     history = train_network(
