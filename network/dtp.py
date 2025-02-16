@@ -158,7 +158,8 @@ class DTPLoss:
     def feedback_loss(self,
                       layer: DTPLayer,
                       input: torch.Tensor,
-                      output: torch.Tensor) -> torch.Tensor:
+                      output: torch.Tensor,
+                      input_loss_scale: float = -2.) -> torch.Tensor:
         """
         Compute feedback training loss for a single layer using difference reconstruction loss.
         Since gradient control is handled at layer level, this focuses purely on the DRL calculation.
@@ -166,6 +167,7 @@ class DTPLoss:
         if not layer.requires_feedback_training:
             return torch.tensor(0.0, device=input.device)
 
+        batch_size = input.shape[0]
         # Generate noise samples
         noise_input = torch.randn_like(input) * self.config.noise_scale
         noise_output = torch.randn_like(output) * self.config.noise_scale
@@ -181,9 +183,13 @@ class DTPLoss:
         recon_noise = layer.feedback_layer(noisy_output)
         recon_output = layer.feedback_layer(output + noise_output)
 
+        # Get the reconstruction differences
+        dr = recon_noise - baseline_recon
+        dr_y = recon_output - baseline_recon
+
         # DRL loss terms
-        input_loss = -2 * (noise_input * (recon_noise - baseline_recon)).sum(1).mean()
-        output_loss = torch.square(recon_output - baseline_recon).sum(1).mean()
+        input_loss = input_loss_scale * (noise_input * dr).flatten(1).sum(1).mean() / batch_size
+        output_loss = (dr_y ** 2).flatten(1).sum(1).mean() / batch_size
 
         return input_loss + output_loss
 
@@ -195,6 +201,8 @@ class DTPLoss:
         Compute forward training loss with local targets.
         Gradient control is now handled by the layers, simplifying the loss calculation.
         """
+        batch_size = input.shape[0]
+
         # Forward pass
         output, activations = network(input)
 
@@ -218,7 +226,7 @@ class DTPLoss:
             layer_target = targets[i + 1]
 
             # Local loss for this layer
-            layer_loss = 0.5 * ((layer_output - layer_target) ** 2).sum(1).mean()
+            layer_loss = 0.5 * ((layer_output - layer_target) ** 2).sum(1).mean() / batch_size
             total_loss = total_loss + layer_loss
 
         return total_loss
@@ -251,47 +259,3 @@ class DTPLoss:
                 del loss
 
         return final_loss
-
-    def train_epoch(self,
-                    network: DTPNetwork,
-                    forward_optimizer: torch.optim.Optimizer,
-                    feedback_optimizers: Dict[int, torch.optim.Optimizer],
-                    dataloader: torch.utils.data.DataLoader,
-                    device: torch.device) -> Dict[str, float]:
-        """
-        Train for one epoch, handling both forward and feedback weight updates.
-        Returns dictionary of average losses.
-        """
-        total_forward_loss = 0.0
-        total_feedback_loss = 0.0
-        num_batches = 0
-
-        for batch_input, batch_target in dataloader:
-            batch_input = batch_input.to(device)
-            batch_target = batch_target.to(device)
-
-            # Train feedback weights first
-            output, activations = network(batch_input)
-            for i, layer in enumerate(network.dtp_layers[:-1]):  # Skip last layer
-                if layer.requires_feedback_training:
-                    loss = self.train_feedback_weights(
-                        layer,
-                        feedback_optimizers[i],
-                        activations[i],
-                        activations[i + 1]
-                    )
-                    total_feedback_loss += loss
-
-            # Then train forward weights
-            forward_optimizer.zero_grad()
-            forward_loss = self.forward_loss(network, batch_input, batch_target)
-            forward_loss.backward()
-            forward_optimizer.step()
-
-            total_forward_loss += forward_loss.item()
-            num_batches += 1
-
-        return {
-            'forward_loss': total_forward_loss / num_batches,
-            'feedback_loss': total_feedback_loss / num_batches
-        }
