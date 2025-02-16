@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 
 
@@ -13,39 +13,68 @@ class DTPLossConfig:
 
 
 class DTPLayer(nn.Module):
-    """An improved DTP layer with local gradient control."""
+    """A layer in the DTP network with activation functions in both pathways."""
 
-    def __init__(self, forward_layer: nn.Module):
+    def __init__(self,
+                 input_size: int,
+                 output_size: int,
+                 activation_fn: Optional[nn.Module] = None,
+                 is_output_layer: bool = False):
         super().__init__()
-        self.forward_layer = forward_layer
-        self.feedback_layer = self._create_feedback_layer(forward_layer)
-        self.requires_feedback_training = True
 
-    def _create_feedback_layer(self, forward_layer: nn.Module) -> nn.Module:
-        """Creates a feedback layer matching the forward layer architecture."""
-        if isinstance(forward_layer, nn.Linear):
+        self.input_size = input_size
+        self.output_size = output_size
+        self.is_output_layer = is_output_layer
+
+        # Forward pathway components
+        self.forward_layer = nn.Linear(input_size, output_size)
+        nn.init.kaiming_normal_(self.forward_layer.weight, nonlinearity='relu')
+        nn.init.zeros_(self.forward_layer.bias)
+        self.forward_activation = activation_fn if activation_fn is not None else nn.Identity()
+
+        # Feedback pathway components
+        self.feedback_layer, self.feedback_activation = self._create_feedback_layer(self.forward_layer)
+
+    def _create_feedback_layer(self, forward_layer: nn.Module) -> Tuple[nn.Module, nn.Module]:
+        """Creates a feedback layer with appropriate activation function."""
+        if isinstance(forward_layer, nn.Linear) and not self.is_output_layer:
+            # Create feedback linear layer
             feedback = nn.Linear(forward_layer.out_features,
                                  forward_layer.in_features,
                                  bias=True)
+
             # Initialize feedback weights
             with torch.no_grad():
                 feedback.weight.copy_(forward_layer.weight.t())
-            return feedback
+
+            # Create feedback activation - same as forward for monotonic functions
+            feedback_activation = (
+                type(self.forward_activation)()
+                if self.forward_activation is not None
+                else nn.Identity()
+            )
+
+            self.requires_feedback_training = True
+            return feedback, feedback_activation
+
+        elif isinstance(forward_layer, nn.Conv2d) and not self.is_output_layer:
+            pass
+
         else:
             self.requires_feedback_training = False
-            return nn.Identity()
+            return nn.Identity(), nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the layer."""
-        # Detach input to prevent global gradient flow
-        x = x.detach()
-        return self.forward_layer(x)
+        x = x.detach()  # Prevent global gradient flow
+        x = self.forward_layer(x)
+        return self.forward_activation(x)
 
     def feedback(self, x: torch.Tensor) -> torch.Tensor:
         """Feedback pass through the layer."""
-        # Detach input to prevent global gradient flow
-        x = x.detach()
-        return self.feedback_layer(x)
+        x = x.detach()  # Prevent global gradient flow
+        x = self.feedback_layer(x)
+        return self.feedback_activation(x)
 
     def compute_target(self,
                        current_activation: torch.Tensor,
@@ -57,26 +86,46 @@ class DTPLayer(nn.Module):
         next_layer_target = next_layer_target.detach()
         next_layer_activation = next_layer_activation.detach()
 
-        # Apply difference correction
-        target = self.feedback(next_layer_target) - \
-                 (self.feedback(next_layer_activation) - current_activation)
+        target = self.feedback(next_layer_target) - (self.feedback(next_layer_activation) - current_activation)
         return target
 
 
 class DTPNetwork(nn.Module):
     """Neural network using DTP layers."""
 
-    def __init__(self, layers: List[nn.Module]):
+    def __init__(self,
+                 input_size: int,
+                 hidden_sizes: List[int],
+                 output_size: int,
+                 hidden_activation: Optional[nn.Module] = nn.ReLU()):
         super().__init__()
-        self.dtp_layers = nn.ModuleList([DTPLayer(layer) for layer in layers])
+
+        # Build network architecture
+        layer_sizes = [input_size] + hidden_sizes + [output_size]
+        self.dtp_layers = nn.ModuleList()
+
+        # Create layers
+        for i in range(len(layer_sizes) - 1):
+            is_output = i == len(layer_sizes) - 2  # True for last layer before output
+            activation = None if is_output else hidden_activation
+
+            layer = DTPLayer(
+                input_size=layer_sizes[i],
+                output_size=layer_sizes[i + 1],
+                activation_fn=activation,
+                is_output_layer=is_output
+            )
+            self.dtp_layers.append(layer)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Forward pass returning both output and intermediate activations."""
         activations = [x]
         current = x
+
         for layer in self.dtp_layers:
             current = layer(current)
             activations.append(current)
+
         return current, activations
 
     def compute_targets(self,
@@ -123,26 +172,20 @@ class DTPLoss:
 
         # Forward pass with noise
         noisy_input = input + noise_input
+        noisy_output = layer.forward_layer(noisy_input)
 
         # Get baseline reconstruction
-        baseline_reconstruction = layer.feedback_layer(output)
+        baseline_recon = layer.feedback_layer(output)
 
-        # Reconstruction through forward-feedback loop
-        reconstruction_noise = layer.feedback_layer(
-            layer.forward_layer(noisy_input)
-        )
+        # Get noisy reconstructions
+        recon_noise = layer.feedback_layer(noisy_output)
+        recon_output = layer.feedback_layer(output + noise_output)
 
-        # Output perturbation reconstruction
-        perturbed_output = output + noise_output
-        reconstruction_output = layer.feedback_layer(perturbed_output)
+        # DRL loss terms
+        input_loss = -2 * (noise_input * (recon_noise - baseline_recon)).sum(1).mean()
+        output_loss = torch.square(recon_output - baseline_recon).sum(1).mean()
 
-        # First term: input perturbation loss
-        first_term = -2 * (noise_input * (reconstruction_noise - baseline_reconstruction)).sum(1).mean()
-
-        # Second term: output perturbation loss
-        second_term = torch.square(reconstruction_output - baseline_reconstruction).sum(1).mean()
-
-        return first_term + second_term
+        return input_loss + output_loss
 
     def forward_loss(self,
                      network: DTPNetwork,
@@ -163,7 +206,7 @@ class DTPLoss:
                                    create_graph=False)[0]
 
         # Compute output target
-        output_target = output - self.config.beta * grad
+        output_target = output - self.config.beta * grad.detach()
 
         # Get targets for all layers
         targets = network.compute_targets(activations, output_target)
@@ -180,28 +223,33 @@ class DTPLoss:
 
         return total_loss
 
-    def train_feedback_weights(self,
-                               layer: DTPLayer,
-                               optimizer: torch.optim.Optimizer,
-                               input: torch.Tensor,
-                               output: torch.Tensor) -> float:
+    def train_feedback_weights(
+            self,
+            layer: DTPLayer,
+            optimizer: torch.optim.Optimizer,
+            input: torch.Tensor,
+            output: torch.Tensor
+    ) -> float:
         """
-        Train feedback weights for a single layer over multiple iterations.
+        Train feedback weights over multiple iterations.
         Returns the final loss value.
         """
         final_loss = 0.0
+
         for i in range(self.config.K_iterations):
             optimizer.zero_grad()
             loss = self.feedback_loss(layer, input, output)
+
             # On all but the last iteration, retain the graph
-            retain_graph = (i < self.config.K_iterations - 1)
+            retain_graph = (i < self.config.K_iterations)
             loss.backward(retain_graph=retain_graph)
             optimizer.step()
             final_loss = loss.item()
 
-            # Clear memory between iterations if needed
+            # Clear memory between iterations if not retaining graph
             if not retain_graph:
                 del loss
+
         return final_loss
 
     def train_epoch(self,

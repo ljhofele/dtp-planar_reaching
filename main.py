@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,7 +11,9 @@ from kinematics.planar_arms import PlanarArms
 
 
 def create_dtp_network(
+        input_dim: int,
         layer_dims: List[int],
+        output_dim: int,
         activation_fn: Optional[str] = "relu"
 ) -> DTPNetwork:
     """Create a DTP network."""
@@ -18,26 +22,15 @@ def create_dtp_network(
         'relu': nn.ReLU(),
         'leaky_relu': nn.LeakyReLU(0.1),
         'elu': nn.ELU(),
-        None: nn.Identity()
     }
 
     if activation_fn not in activation_fns:
         raise ValueError(f"Unsupported activation function: {activation_fn}")
 
-    layers = []
-
-    # Create layers with kaiming initialization
-    for i in range(len(layer_dims) - 1):
-        linear = nn.Linear(layer_dims[i], layer_dims[i + 1])
-        nn.init.kaiming_normal_(linear.weight, nonlinearity='relu')
-        nn.init.zeros_(linear.bias)
-        layers.append(linear)
-
-        # Add activation except for last layer
-        if i < len(layer_dims) - 2 and activation_fn:
-            layers.append(activation_fns[activation_fn])
-
-    return DTPNetwork(layers)
+    return DTPNetwork(input_size=input_dim,
+                      hidden_sizes=layer_dims,
+                      output_size=output_dim,
+                      hidden_activation=activation_fns[activation_fn])
 
 
 def train_epoch(
@@ -48,6 +41,7 @@ def train_epoch(
         buffer: MovementBuffer,
         num_batches: int,
         batch_size: int,
+        clip_gradients: bool = True,
 ) -> Dict[str, float]:
     """
     Train the network for one epoch using the movement buffer.
@@ -79,6 +73,9 @@ def train_epoch(
         forward_optimizer.zero_grad()
         forward_loss = loss_fn.forward_loss(network, inputs, targets)
         forward_loss.backward()
+        if clip_gradients:
+            torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0)
+
         forward_optimizer.step()
 
         total_forward_loss += forward_loss.item()
@@ -227,19 +224,20 @@ def evaluate_reaching(
 
 if __name__ == "__main__":
     import argparse
+    import matplotlib.pyplot as plt
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--arm', type=str, default="right", choices=["right", "left"])
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_batches', type=int, default=100)
     parser.add_argument('--num_epochs', type=int, default=5_000)
     parser.add_argument('--trainings_buffer_size', type=int, default=5_000)
-    parser.add_argument('--validation_interval', type=int, default=50)
+    parser.add_argument('--validation_interval', type=int, default=25)
     parser.add_argument('--device', type=str, default="cpu")
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--beta', type=float, default=0.5)
-    parser.add_argument('--noise_scale', type=float, default=0.05)
-    parser.add_argument('--K_iterations', type=int, default=5)
+    parser.add_argument('--beta', type=float, default=0.9)
+    parser.add_argument('--noise_scale', type=float, default=0.1)
+    parser.add_argument('--K_iterations', type=int, default=3)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -253,7 +251,9 @@ if __name__ == "__main__":
 
     # Setup
     network = create_dtp_network(
-        layer_dims=[4, 128, 64, 32, 2],
+        input_dim=4,
+        layer_dims=[4, 128, 128, 2],
+        output_dim=2,
         activation_fn="elu"
     ).to(device)
 
@@ -287,3 +287,18 @@ if __name__ == "__main__":
         device=device
     )
     tqdm.write(f"Final reaching error: {final_error:.2f}mm")
+
+    # Plot history
+    plot_folder = "figures/"
+    os.makedirs(plot_folder, exist_ok=True)
+
+    fig, axs = plt.subplots(nrows=3, ncols=1, figsize=(12, 8))
+    axs[0].plot(history['forward_loss'], label='Forward Loss')
+    axs[1].plot(history['feedback_loss'], label='Feedback Loss')
+    axs[2].plot(history['validation_error'], label='Validation Error')
+    for ax in axs:
+        ax.set_xlabel('Epoch')
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig(plot_folder + f"history_{args.arm}.png")
+    plt.close(fig)
