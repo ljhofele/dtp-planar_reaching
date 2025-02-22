@@ -113,11 +113,13 @@ def train_epoch(
         forward_loss = torch.nn.functional.mse_loss(predictions, targets)
 
         # Train feedback weights
+        print('Training feedback weights')
         feedback_optimizer.zero_grad()
         network.train_feedback_weights(sigma=sigma)
         feedback_optimizer.step()
 
         # Train forward weights using DTP
+        print('Training forward weights')
         forward_optimizer.zero_grad()
         network.backward(forward_loss, target_lr=target_lr)
         forward_optimizer.step()

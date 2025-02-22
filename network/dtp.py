@@ -12,6 +12,7 @@ class DTPLossConfig:
     beta: float = 0.9  # Damping factor for target propagation
     noise_scale: float = 0.1  # Scale of noise for feedback training
 
+
 class DTPLayer(nn.Module):
     def __init__(self,
                  in_features: int,
@@ -24,7 +25,7 @@ class DTPLayer(nn.Module):
         # Store activation type first
         self._activation = activation
 
-        # Forward parameters: in_features -> out_features
+        # Forward parameters:
         self._weights = nn.Parameter(torch.Tensor(out_features, in_features),
                                      requires_grad=forward_requires_grad)
         if bias:
@@ -33,8 +34,7 @@ class DTPLayer(nn.Module):
         else:
             self._bias = None
 
-        # Feedback parameters: out_features -> in_features
-        self._feedback_weights = nn.Parameter(torch.Tensor(out_features, in_features), requires_grad=False)
+        self._feedback_weights = nn.Parameter(torch.Tensor(in_features, out_features), requires_grad=False)
 
         if bias:
             self._feedback_bias = nn.Parameter(torch.Tensor(in_features),
@@ -86,7 +86,7 @@ class DTPLayer(nn.Module):
         """Propagate activations backward through feedback weights."""
         print(h.shape, self._feedback_weights.shape)
         # Note: need to transpose feedback weights for proper dimensions
-        result = F.linear(h, self._feedback_weights.t(), self._feedback_bias)
+        result = F.linear(h, self._feedback_weights, self._feedback_bias)
         return result
 
     def get_forward_parameter_list(self):
@@ -150,17 +150,18 @@ class DTPLayer(nn.Module):
         return self._activations
 
     def backward(self,
-                 output_target: torch.Tensor,
-                 layer_activation: torch.Tensor,
-                 output_activation: torch.Tensor) -> torch.Tensor:
+                output_target: torch.Tensor,
+                layer_activation: torch.Tensor,
+                output_activation: torch.Tensor) -> torch.Tensor:
         """Compute target for this layer using difference target propagation."""
-        # Get reconstructed activations
-        target_reconstruction = self.propagate_backward(output_target)
-        activation_reconstruction = self.propagate_backward(output_activation)
+        # Get reconstructed activations using feedback weights
+        target_reconstruction = self.propagate_backward(output_target)  # [batch_size, layer_dim]
+        activation_reconstruction = self.propagate_backward(output_activation)  # [batch_size, layer_dim]
 
         print(target_reconstruction.shape, layer_activation.shape, activation_reconstruction.shape)
-        # Apply difference correction
-        layer_target = target_reconstruction + layer_activation - activation_reconstruction
+        # Apply difference correction formula from DTP paper:
+        # h_target = g(h_target_next) + (h - g(h_next))
+        layer_target = target_reconstruction + (layer_activation - activation_reconstruction)
 
         return layer_target
 
