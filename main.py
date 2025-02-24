@@ -192,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument('--noise_scale', type=float, default=0.1)
     parser.add_argument('--K_iterations', type=int, default=3, help="Number of feedback updates during training")
     parser.add_argument('--feedback_lr', type=float, default=1e-4)
+    parser.add_argument('--plot_history', type=bool, default=True)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -241,3 +242,22 @@ if __name__ == "__main__":
         device=device
     )
     print(f"Final reaching error: {final_error:.2f}mm")
+
+    # Plot history
+    if args.plot_history:
+        import os
+        import matplotlib.pyplot as plt
+
+        plot_folder = "figures/"
+        os.makedirs(plot_folder, exist_ok=True)
+
+        fig, axs = plt.subplots(nrows=3, ncols=1, figsize=(12, 8))
+        axs[0].plot(history['forward_loss'], label='Forward Loss')
+        axs[1].plot(history['feedback_loss'], label='Feedback Loss')
+        axs[2].plot(history['validation_error'], label='Validation Error')
+        for ax in axs:
+            ax.set_xlabel('Epoch')
+            ax.legend()
+        plt.tight_layout()
+        plt.savefig(plot_folder + f"history_{args.arm}.png")
+        plt.close(fig)
