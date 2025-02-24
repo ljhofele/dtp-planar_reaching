@@ -53,9 +53,14 @@ class DTPLayer(nn.Module):
             bound = 1 / torch.sqrt(torch.tensor(self.in_features).float())
             nn.init.uniform_(self.weights, -bound, bound)
             nn.init.uniform_(self.feedback_weights, -bound, bound)
+        elif self.activation_type in ['identity', None]:
+            # For linear layers, Xavier uniform initialization is appropriate
+            bound = 1 / torch.sqrt(torch.tensor(self.in_features).float())
+            nn.init.uniform_(self.weights, -bound, bound)
+            nn.init.uniform_(self.feedback_weights, -bound, bound)
         else:
             if self.activation_type == 'elu':
-                gain = nn.init.calculate_gain('relu')
+                gain = nn.init.calculate_gain('relu')  # Use ReLU gain cause ELU doesn't have a gain
             else:
                 gain = nn.init.calculate_gain(self.activation_type)
 
@@ -99,8 +104,6 @@ class DTPLayer(nn.Module):
 
     def compute_forward_gradients(self, h_target: torch.Tensor) -> None:
         """Compute gradients for the forward parameters."""
-        batch_size = h_target.shape[0]
-
         # Get Jacobian approximation for activation function
         jacobian = self.compute_jacobian(self.pre_activation)
 
@@ -195,8 +198,9 @@ class DTPLayer(nn.Module):
 
             # Compute gradients
             grads = torch.autograd.grad(reconstruction_loss,
-                                      [self.feedback_weights] + ([self.feedback_bias] if self.feedback_bias is not None else []),
-                                      retain_graph=False)
+                                        [self.feedback_weights] + (
+                                            [self.feedback_bias] if self.feedback_bias is not None else []),
+                                        retain_graph=False)
 
             # Update feedback weights
             with torch.no_grad():
@@ -212,7 +216,12 @@ class DTPLayer(nn.Module):
 class DTPNetwork(nn.Module):
     """Neural network using enhanced DTP layers."""
 
-    def __init__(self, layer_sizes: List[int], activation: str = 'tanh', config: DTPConfig = DTPConfig()):
+    def __init__(self,
+                 layer_sizes: List[int],
+                 activation: str = 'tanh',
+                 config: DTPConfig = DTPConfig(),
+                 bias: bool = True,
+                 final_activation: Optional[str] = None):
         super().__init__()
 
         self.layers = nn.ModuleList()
@@ -220,8 +229,9 @@ class DTPNetwork(nn.Module):
             layer = DTPLayer(
                 in_features=layer_sizes[i],
                 out_features=layer_sizes[i + 1],
-                activation=activation,
-                config=config
+                activation=activation if i < len(layer_sizes) - 2 else final_activation,
+                config=config,
+                bias=bias
             )
             self.layers.append(layer)
 
@@ -281,6 +291,6 @@ class DTPNetwork(nn.Module):
         # Compute forward loss using the computed targets
         forward_loss = torch.tensor(0.0, device=input.device)
         for i, layer in enumerate(self.layers[:-1]):
-            forward_loss += layer.compute_local_loss(targets[i+1])
+            forward_loss += layer.compute_local_loss(targets[i + 1])
 
         return forward_loss, torch.tensor(feedback_loss)
