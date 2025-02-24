@@ -11,7 +11,9 @@ from kinematics.planar_arms import PlanarArms
 def create_dtp_network(
         layer_dims: List[int],
         activation: str = "tanh",
-        config: Optional[DTPConfig] = None
+        config: Optional[DTPConfig] = None,
+        bias: bool = True,
+        final_activation: Optional[str] = None,
 ) -> DTPNetwork:
     """Create a DTP network with the specified architecture."""
     if config is None:
@@ -20,7 +22,9 @@ def create_dtp_network(
     return DTPNetwork(
         layer_sizes=layer_dims,
         activation=activation,
-        config=config
+        config=config,
+        bias=bias,
+        final_activation=final_activation
     )
 
 
@@ -146,7 +150,7 @@ def evaluate_reaching(
             )
 
             # Get network prediction
-            outputs, _ = network(inputs)
+            outputs, _ = network.forward(inputs)
 
             # Convert network outputs and targets back to radians
             target_delta_thetas = inverse_target_transform(targets.cpu().numpy())
@@ -177,16 +181,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--arm', type=str, default="right", choices=["right", "left"])
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_batches', type=int, default=100)
     parser.add_argument('--num_epochs', type=int, default=5_000)
     parser.add_argument('--trainings_buffer_size', type=int, default=5_000)
-    parser.add_argument('--validation_interval', type=int, default=20)
+    parser.add_argument('--validation_interval', type=int, default=50)
     parser.add_argument('--device', type=str, default="cpu")
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--beta', type=float, default=0.9)
     parser.add_argument('--noise_scale', type=float, default=0.1)
-    parser.add_argument('--K_iterations', type=int, default=5)
+    parser.add_argument('--K_iterations', type=int, default=3, help="Number of feedback updates during training")
     parser.add_argument('--feedback_lr', type=float, default=1e-4)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
